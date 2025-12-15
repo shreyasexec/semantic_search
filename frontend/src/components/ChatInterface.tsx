@@ -1,9 +1,9 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import MessageBubble from './MessageBubble';
 import ClarificationCard from './ClarificationCard';
 import ResultCard from './ResultCard';
 import LoadingIndicator from './LoadingIndicator';
-import { sendQuery, sendClarification } from '../services/api';
+import { sendQuery, sendClarification, getIngestionStatus, triggerIngestion, IngestionStatus } from '../services/api';
 
 interface Message {
   id: string;
@@ -24,15 +24,54 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ tenantId }) => {
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [ingestionStatus, setIngestionStatus] = useState<IngestionStatus | null>(null);
+  const [isIngesting, setIsIngesting] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  const fetchIngestionStatus = useCallback(async () => {
+    try {
+      const status = await getIngestionStatus(tenantId);
+      setIngestionStatus(status);
+      setIsIngesting(status.current_status === 'in_progress');
+    } catch (error) {
+      console.error('Failed to fetch ingestion status:', error);
+    }
+  }, [tenantId]);
+
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Fetch ingestion status on mount and periodically
+  useEffect(() => {
+    fetchIngestionStatus();
+    const interval = setInterval(fetchIngestionStatus, 10000); // Every 10 seconds
+    return () => clearInterval(interval);
+  }, [fetchIngestionStatus]);
+
+  const handleTriggerIngestion = async () => {
+    if (isIngesting) return;
+
+    try {
+      setIsIngesting(true);
+      await triggerIngestion(tenantId);
+      // Refresh status after triggering
+      setTimeout(fetchIngestionStatus, 1000);
+    } catch (error) {
+      alert(`Failed to trigger ingestion: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      setIsIngesting(false);
+    }
+  };
+
+  const formatLastSync = (isoString: string | null): string => {
+    if (!isoString) return 'Never';
+    const date = new Date(isoString);
+    return date.toLocaleString();
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -127,6 +166,31 @@ const ChatInterface: React.FC<ChatInterfaceProps> = ({ tenantId }) => {
 
   return (
     <div style={styles.container}>
+      {/* Ingestion Status Bar */}
+      <div style={styles.ingestionBar}>
+        <div style={styles.ingestionInfo}>
+          <span style={styles.ingestionLabel}>Data Sync Status:</span>
+          <span style={styles.ingestionStatus}>
+            {isIngesting ? 'In Progress...' : ingestionStatus?.current_status || 'Unknown'}
+          </span>
+          {ingestionStatus && (
+            <span style={styles.lastSync}>
+              Last sync: {formatLastSync(ingestionStatus.last_mssql_sync)}
+            </span>
+          )}
+        </div>
+        <button
+          onClick={handleTriggerIngestion}
+          style={{
+            ...styles.ingestionButton,
+            ...(isIngesting ? styles.ingestionButtonDisabled : {}),
+          }}
+          disabled={isIngesting}
+        >
+          {isIngesting ? 'Syncing...' : 'Sync Data'}
+        </button>
+      </div>
+
       <div style={styles.messagesContainer}>
         {messages.length === 0 && (
           <div style={styles.welcomeMessage}>
@@ -209,6 +273,45 @@ const styles: { [key: string]: React.CSSProperties } = {
     display: 'flex',
     flexDirection: 'column',
     height: '100%',
+  },
+  ingestionBar: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '12px 20px',
+    backgroundColor: '#1e293b',
+    borderBottom: '1px solid #334155',
+  },
+  ingestionInfo: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '16px',
+    fontSize: '13px',
+  },
+  ingestionLabel: {
+    color: '#64748b',
+  },
+  ingestionStatus: {
+    color: '#22c55e',
+    fontWeight: 500,
+  },
+  lastSync: {
+    color: '#94a3b8',
+    fontSize: '12px',
+  },
+  ingestionButton: {
+    padding: '8px 16px',
+    borderRadius: '6px',
+    border: 'none',
+    backgroundColor: '#10b981',
+    color: '#ffffff',
+    fontSize: '13px',
+    fontWeight: 500,
+    cursor: 'pointer',
+  },
+  ingestionButtonDisabled: {
+    backgroundColor: '#475569',
+    cursor: 'not-allowed',
   },
   messagesContainer: {
     flex: 1,

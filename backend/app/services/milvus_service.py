@@ -137,6 +137,54 @@ class MilvusService:
         logger.info(f"Created collection {collection_name}")
         return collection
 
+    def create_assets_collection(self) -> Collection:
+        """Create the assets collection for Neo4j node embeddings.
+
+        Since Neo4j is transactional and cannot store embeddings efficiently,
+        we store asset embeddings in Milvus for vector search.
+
+        Returns:
+            Created or existing Collection
+        """
+        self.ensure_connected()
+
+        collection_name = self.settings.collection_assets
+
+        if utility.has_collection(collection_name):
+            logger.info(f"Collection {collection_name} already exists")
+            return Collection(collection_name)
+
+        fields = [
+            FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=100, is_primary=True),
+            FieldSchema(name="tenant_id", dtype=DataType.VARCHAR, max_length=50, is_partition_key=True),
+            FieldSchema(name="neo4j_node_id", dtype=DataType.INT64),
+            FieldSchema(name="label", dtype=DataType.VARCHAR, max_length=100),
+            FieldSchema(name="name", dtype=DataType.VARCHAR, max_length=500),
+            FieldSchema(name="description", dtype=DataType.VARCHAR, max_length=65535),
+            FieldSchema(name="properties", dtype=DataType.JSON),
+            FieldSchema(name="location", dtype=DataType.VARCHAR, max_length=500),
+            FieldSchema(name="status", dtype=DataType.VARCHAR, max_length=100),
+            FieldSchema(name="updated_at", dtype=DataType.INT64),
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.app_settings.embedding_dimension),
+        ]
+
+        schema = CollectionSchema(fields=fields, description="Neo4j asset embeddings")
+        collection = Collection(name=collection_name, schema=schema)
+
+        # Create HNSW index
+        index_params = {
+            "metric_type": "COSINE",
+            "index_type": "HNSW",
+            "params": {
+                "M": self.settings.hnsw_m,
+                "efConstruction": self.settings.hnsw_ef_construction,
+            },
+        }
+        collection.create_index(field_name="embedding", index_params=index_params)
+
+        logger.info(f"Created collection {collection_name} with HNSW index")
+        return collection
+
     def create_statistics_collection(self) -> Collection:
         """Create the statistics collection.
 
@@ -353,6 +401,98 @@ class MilvusService:
         )
 
         return results
+
+    async def search_assets(
+        self,
+        query_vector: list[float],
+        filter_expr: str = "",
+        limit: int = 20,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Search Neo4j assets stored in Milvus.
+
+        Args:
+            query_vector: Query embedding vector
+            filter_expr: Optional filter expression
+            limit: Maximum results
+            tenant_id: Optional tenant filter
+
+        Returns:
+            List of search results
+        """
+        self.ensure_connected()
+
+        collection = Collection(self.settings.collection_assets)
+        collection.load()
+
+        search_params = {
+            "metric_type": "COSINE",
+            "params": {"ef": self.settings.hnsw_ef_search},
+        }
+
+        output_fields = [
+            "id", "tenant_id", "neo4j_node_id", "label", "name",
+            "description", "properties", "location", "status",
+        ]
+
+        # Add tenant filter if provided
+        if tenant_id and not filter_expr:
+            filter_expr = f'tenant_id == "{tenant_id}"'
+        elif tenant_id and filter_expr:
+            filter_expr = f'tenant_id == "{tenant_id}" AND ({filter_expr})'
+
+        results = collection.search(
+            data=[query_vector],
+            anns_field="embedding",
+            param=search_params,
+            limit=limit,
+            expr=filter_expr if filter_expr else None,
+            output_fields=output_fields,
+        )
+
+        formatted_results = []
+        for hits in results:
+            for hit in hits:
+                result = {
+                    "id": hit.id,
+                    "score": hit.score,
+                    "source": "neo4j",
+                }
+                for field in output_fields:
+                    if hasattr(hit.entity, field):
+                        result[field] = getattr(hit.entity, field)
+                formatted_results.append(result)
+
+        return formatted_results
+
+    async def upsert_assets(
+        self,
+        assets: list[dict[str, Any]],
+        tenant_id: str = "default",
+    ) -> int:
+        """Upsert Neo4j assets into Milvus.
+
+        Args:
+            assets: List of asset records with embeddings
+            tenant_id: Tenant identifier
+
+        Returns:
+            Number of assets upserted
+        """
+        self.ensure_connected()
+
+        collection = Collection(self.settings.collection_assets)
+
+        # Ensure all required fields are present
+        for asset in assets:
+            if "tenant_id" not in asset:
+                asset["tenant_id"] = tenant_id
+
+        collection.upsert(assets)
+        collection.flush()
+
+        logger.info(f"Upserted {len(assets)} assets to {self.settings.collection_assets}")
+        return len(assets)
 
     def health_check(self) -> bool:
         """Check if Milvus is accessible."""

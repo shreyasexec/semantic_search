@@ -36,6 +36,7 @@ class MilvusSettings(BaseSettings):
     host: str = Field(default="localhost", env="MILVUS_HOST")
     port: int = Field(default=19530, env="MILVUS_PORT")
     collection_entities: str = Field(default="entities")
+    collection_assets: str = Field(default="assets")  # Neo4j asset embeddings
     collection_schema: str = Field(default="schema_metadata")
     collection_stats: str = Field(default="statistics")
 

@@ -104,3 +104,37 @@ export async function transcribeVoice(audioBlob: Blob): Promise<{ text: string }
 
   return response.json();
 }
+
+export interface IngestionStatus {
+  tenant_id: string;
+  last_mssql_sync: string | null;
+  last_neo4j_enhancement: string | null;
+  current_status: string;
+}
+
+export async function getIngestionStatus(tenantId: string): Promise<IngestionStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/ingestion/status/${tenantId}`);
+
+  if (!response.ok) {
+    throw new Error('Failed to get ingestion status');
+  }
+
+  return response.json();
+}
+
+export async function triggerIngestion(tenantId: string): Promise<{
+  status: string;
+  tenant_id: string;
+  message: string;
+}> {
+  const response = await fetch(`${API_BASE_URL}/api/ingestion/trigger/${tenantId}`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to trigger ingestion');
+  }
+
+  return response.json();
+}

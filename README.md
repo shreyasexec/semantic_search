@@ -45,6 +45,7 @@ User Query -> FastAPI Backend -> LangGraph Orchestrator -> Response
 - Neo4j instance at 192.168.110.201:7687
 - MSSQL instance at 192.168.110.56:1444
 - Ollama instance at 192.168.1.120:11434
+- uv (Python package manager)
 
 ### Setup
 
@@ -59,28 +60,24 @@ cd semantic_search
 docker-compose up -d milvus redis
 ```
 
-3. Setup Milvus collections:
+3. Start the backend:
 ```bash
-cd scripts
-python setup_milvus.py
+cd backend
+uv run semantic
 ```
 
-4. Enhance Neo4j nodes (add embeddings):
+4. Start the frontend (in another terminal):
 ```bash
-python setup_neo4j.py
+cd frontend
+npm install
+npm run dev
 ```
 
-5. Run initial data ingestion:
-```bash
-python initial_ingestion.py --tenant tenant_001
-```
+5. Access the UI at http://localhost:3000
 
-6. Start the application:
-```bash
-docker-compose up -d backend frontend
-```
+6. Click "Sync Data" button in the UI to trigger initial data ingestion
 
-7. Access the UI at http://localhost:3000
+**Note:** All data ingestion (MSSQL sync and Neo4j asset embeddings) is triggered from the UI. Embeddings are stored in Milvus (not Neo4j) for efficient vector search.
 
 ## API Endpoints
 
@@ -90,8 +87,10 @@ docker-compose up -d backend frontend
 - `POST /api/clarify` - Submit clarification response
 - `POST /api/voice` - Transcribe voice input
 - `GET /api/health` - Health check
-- `POST /api/sync/{tenant_id}` - Trigger data sync
+- `POST /api/sync/{tenant_id}` - Trigger MSSQL data sync
 - `GET /api/schema/{tenant_id}` - Get discovered schema
+- `GET /api/ingestion/status/{tenant_id}` - Get ingestion status and last sync time
+- `POST /api/ingestion/trigger/{tenant_id}` - Trigger full ingestion (MSSQL + assets)
 
 ### WebSocket
 
@@ -144,7 +143,7 @@ smart-city-semantic-search/
 │   │   ├── models/        # Pydantic models
 │   │   └── services/      # Database clients
 │   ├── tests/
-│   ├── requirements.txt
+│   ├── pyproject.toml     # uv project config
 │   └── Dockerfile
 ├── frontend/
 │   ├── src/
@@ -153,7 +152,6 @@ smart-city-semantic-search/
 │   │   └── services/      # API client
 │   ├── package.json
 │   └── Dockerfile
-├── scripts/               # Setup scripts
 ├── docker-compose.yml
 └── README.md
 ```
@@ -174,8 +172,7 @@ smart-city-semantic-search/
 
 ```bash
 cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+uv run semantic
 ```
 
 ### Frontend
@@ -183,14 +180,14 @@ uvicorn app.main:app --reload
 ```bash
 cd frontend
 npm install
-npm start
+npm run dev
 ```
 
 ### Tests
 
 ```bash
 cd backend
-pytest
+uv run pytest
 ```
 
 ## Performance Targets

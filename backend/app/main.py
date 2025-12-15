@@ -78,7 +78,8 @@ async def root():
     }
 
 
-if __name__ == "__main__":
+def run():
+    """Entry point for uv run semantic."""
     import uvicorn
 
     settings = get_settings()
@@ -90,3 +91,7 @@ if __name__ == "__main__":
         reload=settings.app.debug,
         log_level=settings.app.log_level.lower(),
     )
+
+
+if __name__ == "__main__":
+    run()

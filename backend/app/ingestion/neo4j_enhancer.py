@@ -1,10 +1,17 @@
-"""Neo4j enhancement pipeline for adding embeddings."""
+"""Neo4j enhancement pipeline for adding embeddings.
+
+Embeddings are stored in Milvus (not Neo4j) since Neo4j is transactional
+and cannot efficiently store high-dimensional vectors.
+"""
 
 import logging
 from typing import Any
+from datetime import datetime
+import hashlib
 
 from app.config import get_settings
 from app.services.neo4j_service import Neo4jService
+from app.services.milvus_service import MilvusService
 from app.services.llm_service import LLMService
 from app.services.embedding_service import EmbeddingService
 
@@ -12,19 +19,20 @@ logger = logging.getLogger(__name__)
 
 
 class Neo4jEnhancer:
-    """Enhance Neo4j nodes with descriptions and embeddings."""
+    """Enhance Neo4j nodes with descriptions and store embeddings in Milvus."""
 
     def __init__(self):
         self.settings = get_settings()
         self.neo4j = Neo4jService()
+        self.milvus = MilvusService()
         self.llm = LLMService()
         self.embedding_service = EmbeddingService()
 
-    async def enhance_all_nodes(self, tenant_id: str = None) -> dict:
-        """Enhance all nodes with descriptions and embeddings.
+    async def enhance_all_nodes(self, tenant_id: str = "default") -> dict:
+        """Enhance all nodes with descriptions and store embeddings in Milvus.
 
         Args:
-            tenant_id: Optional tenant identifier
+            tenant_id: Tenant identifier for multi-tenant isolation
 
         Returns:
             Enhancement statistics
@@ -32,6 +40,10 @@ class Neo4jEnhancer:
         logger.info("Starting Neo4j enhancement pipeline")
 
         await self.neo4j.connect()
+        self.milvus.connect()
+
+        # Ensure assets collection exists
+        self.milvus.create_assets_collection()
 
         try:
             # Get all labels
@@ -42,12 +54,9 @@ class Neo4jEnhancer:
             total_skipped = 0
 
             for label in labels:
-                enhanced, skipped = await self._enhance_label(label)
+                enhanced, skipped = await self._enhance_label(label, tenant_id)
                 total_enhanced += enhanced
                 total_skipped += skipped
-
-            # Create/update vector indexes
-            await self._create_vector_indexes(labels)
 
             logger.info(
                 f"Enhancement complete: {total_enhanced} enhanced, "
@@ -62,22 +71,23 @@ class Neo4jEnhancer:
 
         finally:
             await self.neo4j.close()
+            self.milvus.close()
 
-    async def _enhance_label(self, label: str) -> tuple[int, int]:
+    async def _enhance_label(self, label: str, tenant_id: str) -> tuple[int, int]:
         """Enhance all nodes of a specific label.
 
         Args:
             label: Node label
+            tenant_id: Tenant identifier
 
         Returns:
             Tuple of (enhanced_count, skipped_count)
         """
         logger.info(f"Processing label: {label}")
 
-        # Get nodes without embeddings
+        # Get all nodes (we track processed nodes in Milvus now)
         nodes = await self.neo4j.run(f"""
             MATCH (n:{label})
-            WHERE n.embedding IS NULL
             RETURN n, id(n) as nodeId
             LIMIT 1000
         """)
@@ -93,7 +103,7 @@ class Neo4jEnhancer:
         for i in range(0, len(nodes), batch_size):
             batch = nodes[i:i + batch_size]
             batch_enhanced, batch_skipped = await self._enhance_batch(
-                label, batch
+                label, batch, tenant_id
             )
             enhanced += batch_enhanced
             skipped += batch_skipped
@@ -104,12 +114,14 @@ class Neo4jEnhancer:
         self,
         label: str,
         nodes: list[dict],
+        tenant_id: str,
     ) -> tuple[int, int]:
-        """Enhance a batch of nodes.
+        """Enhance a batch of nodes and store embeddings in Milvus.
 
         Args:
             label: Node label
             nodes: List of nodes to enhance
+            tenant_id: Tenant identifier
 
         Returns:
             Tuple of (enhanced_count, skipped_count)
@@ -117,12 +129,11 @@ class Neo4jEnhancer:
         enhanced = 0
         skipped = 0
 
-        # Prepare descriptions
-        descriptions = []
-        node_ids = []
+        # Prepare descriptions and asset records for Milvus
+        assets_to_upsert = []
 
         for node_data in nodes:
-            node = node_data["n"]
+            node = dict(node_data["n"])
             node_id = node_data["nodeId"]
 
             # Check if already has description
@@ -130,38 +141,70 @@ class Neo4jEnhancer:
                 description = node["description"]
             else:
                 # Generate description
-                description = await self._generate_description(label, dict(node))
+                description = await self._generate_description(label, node)
 
-            if description:
-                descriptions.append(description)
-                node_ids.append(node_id)
-            else:
+            if not description:
                 skipped += 1
+                continue
 
-        if not descriptions:
-            return enhanced, skipped
-
-        # Generate embeddings in batch
-        embeddings = await self.embedding_service.embed_batch(descriptions)
-
-        # Update nodes
-        for node_id, description, embedding in zip(node_ids, descriptions, embeddings):
+            # Generate embedding
             try:
-                await self.neo4j.run("""
-                    MATCH (n)
-                    WHERE id(n) = $node_id
-                    SET n.description = $description,
-                        n.embedding = $embedding,
-                        n.embedding_updated_at = datetime()
-                """, {
-                    "node_id": node_id,
-                    "description": description,
-                    "embedding": embedding,
-                })
-                enhanced += 1
+                embedding = await self.embedding_service.embed_query(description)
             except Exception as e:
-                logger.error(f"Failed to update node {node_id}: {e}")
+                logger.error(f"Failed to generate embedding for node {node_id}: {e}")
                 skipped += 1
+                continue
+
+            # Create unique ID for this asset
+            asset_id = f"{tenant_id}_{label}_{node_id}"
+
+            # Extract common fields for filtering
+            name = node.get("name", node.get("id", str(node_id)))
+            location = node.get("location", node.get("floor", node.get("area", "")))
+            status = node.get("status", "")
+
+            # Prepare asset record for Milvus
+            asset = {
+                "id": asset_id,
+                "tenant_id": tenant_id,
+                "neo4j_node_id": node_id,
+                "label": label,
+                "name": str(name)[:500] if name else "",
+                "description": description[:65535],
+                "properties": node,
+                "location": str(location)[:500] if location else "",
+                "status": str(status)[:100] if status else "",
+                "updated_at": int(datetime.now().timestamp()),
+                "embedding": embedding,
+            }
+            assets_to_upsert.append(asset)
+
+        # Batch upsert to Milvus
+        if assets_to_upsert:
+            try:
+                await self.milvus.upsert_assets(assets_to_upsert, tenant_id)
+                enhanced = len(assets_to_upsert)
+
+                # Update Neo4j nodes with description only (not embedding)
+                for asset in assets_to_upsert:
+                    try:
+                        await self.neo4j.run("""
+                            MATCH (n)
+                            WHERE id(n) = $node_id
+                            SET n.description = $description,
+                                n.milvus_asset_id = $asset_id
+                        """, {
+                            "node_id": asset["neo4j_node_id"],
+                            "description": asset["description"],
+                            "asset_id": asset["id"],
+                        })
+                    except Exception as e:
+                        logger.warning(f"Failed to update Neo4j node description: {e}")
+
+            except Exception as e:
+                logger.error(f"Failed to upsert assets to Milvus: {e}")
+                skipped = len(assets_to_upsert)
+                enhanced = 0
 
         return enhanced, skipped
 
@@ -206,47 +249,19 @@ class Neo4jEnhancer:
 
             return ". ".join(parts[:4])
 
-    async def _create_vector_indexes(self, labels: list[str]) -> None:
-        """Create vector indexes for all labels.
-
-        Args:
-            labels: List of labels
-        """
-        logger.info("Creating vector indexes")
-
-        # Get existing indexes
-        existing = await self.neo4j.get_vector_indexes()
-        existing_names = {idx.get("name", "") for idx in existing}
-
-        for label in labels:
-            index_name = f"{label.lower()}_embedding"
-
-            if index_name in existing_names:
-                logger.debug(f"Index {index_name} already exists")
-                continue
-
-            try:
-                await self.neo4j.create_vector_index(
-                    index_name=index_name,
-                    label=label,
-                    property_name="embedding",
-                    dimensions=self.settings.app.embedding_dimension,
-                    similarity_function="cosine",
-                )
-                logger.info(f"Created vector index: {index_name}")
-            except Exception as e:
-                logger.warning(f"Failed to create index {index_name}: {e}")
-
-    async def enhance_new_nodes(self, label: str = None) -> dict:
-        """Enhance only new nodes without embeddings.
+    async def enhance_new_nodes(self, label: str = None, tenant_id: str = "default") -> dict:
+        """Enhance only new nodes and store embeddings in Milvus.
 
         Args:
             label: Optional specific label to process
+            tenant_id: Tenant identifier
 
         Returns:
             Enhancement statistics
         """
         await self.neo4j.connect()
+        self.milvus.connect()
+        self.milvus.create_assets_collection()
 
         try:
             if label:
@@ -257,20 +272,23 @@ class Neo4jEnhancer:
             total_enhanced = 0
 
             for lbl in labels:
-                enhanced, _ = await self._enhance_label(lbl)
+                enhanced, _ = await self._enhance_label(lbl, tenant_id)
                 total_enhanced += enhanced
 
             return {"enhanced": total_enhanced}
 
         finally:
             await self.neo4j.close()
+            self.milvus.close()
 
 
-async def enhance_neo4j_data(tenant_id: str = None) -> dict:
+async def enhance_neo4j_data(tenant_id: str = "default") -> dict:
     """Convenience function to enhance Neo4j data.
 
+    Embeddings are stored in Milvus for vector search.
+
     Args:
-        tenant_id: Optional tenant identifier
+        tenant_id: Tenant identifier for multi-tenant isolation
 
     Returns:
         Enhancement statistics

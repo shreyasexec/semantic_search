@@ -1,10 +1,14 @@
-"""Neo4j query execution node."""
+"""Neo4j query execution node.
+
+Asset embeddings are stored in Milvus (not Neo4j) for efficient vector search.
+"""
 
 import logging
 import json
 
 from app.models.state import SearchState
 from app.services.neo4j_service import Neo4jService
+from app.services.milvus_service import MilvusService
 from app.services.llm_service import LLMService
 from app.services.embedding_service import EmbeddingService
 from app.core.prompts.cypher_generation import (
@@ -18,8 +22,8 @@ logger = logging.getLogger(__name__)
 async def neo4j_query_node(state: SearchState) -> dict:
     """Generate and execute Cypher query on Neo4j.
 
-    This node uses LLM to generate a Cypher query based on the
-    schema and user query, then executes it.
+    For vector search, uses Milvus assets collection instead of Neo4j
+    since embeddings are stored in Milvus.
 
     Args:
         state: Current workflow state
@@ -31,29 +35,32 @@ async def neo4j_query_node(state: SearchState) -> dict:
     intent = state["intent"]
     entities = state.get("entities", {})
     schema = state.get("schema_neo4j", {})
+    tenant_id = state.get("tenant_id", "default")
 
     neo4j = Neo4jService()
+    milvus = MilvusService()
     llm = LLMService()
     embedding_service = EmbeddingService()
 
     await neo4j.connect()
+    milvus.connect()
 
     try:
-        # Check if we should use vector search
+        # Check if we should use vector search (searches Milvus assets)
         use_vector = should_use_vector_search(intent, entities, schema)
 
         if use_vector:
             # Generate query embedding
             query_embedding = await embedding_service.embed_query(query)
 
-            # Execute vector search
+            # Execute vector search on Milvus assets collection
             results = await execute_vector_search(
-                neo4j, query_embedding, schema, entities
+                milvus, query_embedding, entities, tenant_id
             )
 
             return {
                 "neo4j_results": results,
-                "cypher_query": "Vector search executed",
+                "cypher_query": "Vector search executed on Milvus assets",
             }
 
         # Generate Cypher query using LLM
@@ -63,12 +70,7 @@ async def neo4j_query_node(state: SearchState) -> dict:
 
         # Execute query
         try:
-            # Check if query needs embedding parameter
-            if "$embedding" in cypher_query:
-                query_embedding = await embedding_service.embed_query(query)
-                results = await neo4j.run(cypher_query, {"embedding": query_embedding})
-            else:
-                results = await neo4j.run(cypher_query)
+            results = await neo4j.run(cypher_query)
 
             # Format results
             formatted_results = format_neo4j_results(results)
@@ -109,10 +111,13 @@ async def neo4j_query_node(state: SearchState) -> dict:
 
     finally:
         await neo4j.close()
+        milvus.close()
 
 
 def should_use_vector_search(intent: str, entities: dict, schema: dict) -> bool:
     """Determine if vector search should be used.
+
+    Vector search uses Milvus assets collection for semantic similarity.
 
     Args:
         intent: Query intent
@@ -122,11 +127,6 @@ def should_use_vector_search(intent: str, entities: dict, schema: dict) -> bool:
     Returns:
         True if vector search is appropriate
     """
-    # Check if vector indexes exist
-    vector_indexes = schema.get("vector_indexes", [])
-    if not vector_indexes:
-        return False
-
     # Use vector for similarity queries
     if intent == "SIMILARITY":
         return True
@@ -141,76 +141,73 @@ def should_use_vector_search(intent: str, entities: dict, schema: dict) -> bool:
 
 
 async def execute_vector_search(
-    neo4j: Neo4jService,
+    milvus: MilvusService,
     query_embedding: list[float],
-    schema: dict,
     entities: dict,
+    tenant_id: str,
 ) -> list[dict]:
-    """Execute vector similarity search.
+    """Execute vector similarity search on Milvus assets collection.
 
     Args:
-        neo4j: Neo4j service
+        milvus: Milvus service
         query_embedding: Query embedding vector
-        schema: Neo4j schema
         entities: Extracted entities
+        tenant_id: Tenant identifier
 
     Returns:
         Search results
     """
-    # Get first available vector index
-    vector_indexes = schema.get("vector_indexes", [])
-    if not vector_indexes:
-        return []
+    # Build filter expression for Milvus
+    filter_expr = build_milvus_filter(entities)
 
-    index_name = vector_indexes[0]
-
-    # Build filter if entities specify constraints
-    filter_query = build_vector_filter(entities)
-
-    results = await neo4j.vector_search(
-        index_name=index_name,
+    results = await milvus.search_assets(
         query_vector=query_embedding,
-        k=20,
-        filter_query=filter_query,
+        filter_expr=filter_expr,
+        limit=20,
+        tenant_id=tenant_id,
     )
 
     return [
         {
-            "id": r["node"].get("id", ""),
+            "id": r.get("id", ""),
             "source": "neo4j",
-            "entity_type": list(r["node"].keys())[0] if r["node"] else "Unknown",
-            "content": r["node"].get("description", str(r["node"])),
-            "properties": r["node"],
-            "score": r["score"],
+            "entity_type": r.get("label", "Unknown"),
+            "content": r.get("description", ""),
+            "properties": r.get("properties", {}),
+            "score": r.get("score"),
+            "name": r.get("name", ""),
+            "location": r.get("location", ""),
+            "status": r.get("status", ""),
         }
         for r in results
     ]
 
 
-def build_vector_filter(entities: dict) -> str:
-    """Build filter clause for vector search.
+def build_milvus_filter(entities: dict) -> str:
+    """Build filter expression for Milvus search.
 
     Args:
         entities: Extracted entities
 
     Returns:
-        Filter clause string
+        Filter expression string
     """
     conditions = []
 
     if entities.get("location"):
         loc = entities["location"]
-        conditions.append(f'toLower(node.location) CONTAINS toLower("{loc}")')
+        # Milvus uses different syntax than Neo4j
+        conditions.append(f'location like "%{loc}%"')
 
     if entities.get("status"):
         status = entities["status"]
-        conditions.append(f'toLower(node.status) = toLower("{status}")')
+        conditions.append(f'status == "{status}"')
 
     if entities.get("entity_type"):
-        # Can't filter by label in vector search post-filter
-        pass
+        etype = entities["entity_type"]
+        conditions.append(f'label == "{etype}"')
 
-    return " AND ".join(conditions)
+    return " and ".join(conditions)
 
 
 async def generate_cypher(

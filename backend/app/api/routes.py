@@ -293,6 +293,72 @@ async def trigger_sync(
         return {"status": "completed", "tenant_id": tenant_id, **result}
 
 
+@router.get("/ingestion/status/{tenant_id}")
+async def get_ingestion_status(tenant_id: str) -> dict:
+    """Get ingestion status for a tenant.
+
+    Shows last sync times and current status.
+
+    Args:
+        tenant_id: Tenant identifier
+
+    Returns:
+        Ingestion status
+    """
+    if not TenantValidator.validate(tenant_id):
+        raise HTTPException(status_code=400, detail="Invalid tenant_id")
+
+    scheduler = get_scheduler()
+    status = await scheduler.get_ingestion_status(tenant_id)
+
+    return status
+
+
+@router.post("/ingestion/trigger/{tenant_id}")
+async def trigger_ingestion(
+    tenant_id: str,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Trigger full ingestion for a tenant.
+
+    This runs both MSSQL sync and Neo4j enhancement (stores embeddings in Milvus).
+    Runs in background and returns immediately.
+
+    Args:
+        tenant_id: Tenant identifier
+        background_tasks: Background task handler
+
+    Returns:
+        Ingestion trigger status
+    """
+    if not TenantValidator.validate(tenant_id):
+        raise HTTPException(status_code=400, detail="Invalid tenant_id")
+
+    logger.info(f"Full ingestion triggered for {tenant_id}")
+
+    scheduler = get_scheduler()
+
+    # Check if already running
+    status = await scheduler.get_ingestion_status(tenant_id)
+    if status.get("current_status") == "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail="Ingestion already in progress for this tenant",
+        )
+
+    # Run in background
+    background_tasks.add_task(
+        scheduler.run_full_ingestion,
+        tenant_id,
+    )
+
+    return {
+        "status": "started",
+        "tenant_id": tenant_id,
+        "message": "Full ingestion started in background",
+    }
+
+
 @router.get("/schema/{tenant_id}")
 async def get_schema(
     tenant_id: str,

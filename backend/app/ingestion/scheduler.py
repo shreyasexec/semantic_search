@@ -229,6 +229,114 @@ class IngestionScheduler:
 
         return result
 
+    async def run_full_ingestion(self, tenant_id: str) -> dict:
+        """Run full ingestion: MSSQL sync + Neo4j enhancement.
+
+        This is the main ingestion method triggered from UI.
+
+        Args:
+            tenant_id: Tenant identifier
+
+        Returns:
+            Combined ingestion results
+        """
+        logger.info(f"Starting full ingestion for {tenant_id}")
+
+        results = {
+            "tenant_id": tenant_id,
+            "mssql_sync": None,
+            "neo4j_enhancement": None,
+            "started_at": datetime.now().isoformat(),
+            "status": "in_progress",
+        }
+
+        # Save status to cache
+        await self._cache.connect()
+        await self._cache.set(
+            f"ingestion_status:{tenant_id}",
+            "in_progress",
+            ttl=3600,
+        )
+
+        try:
+            # Run MSSQL full sync
+            ingestion = MSSQLIngestion()
+            mssql_result = await ingestion.run_full_sync(tenant_id)
+            results["mssql_sync"] = mssql_result
+            await self._set_last_sync(tenant_id)
+
+            # Run Neo4j enhancement (stores embeddings in Milvus)
+            enhancer = Neo4jEnhancer()
+            neo4j_result = await enhancer.enhance_all_nodes(tenant_id)
+            results["neo4j_enhancement"] = neo4j_result
+            await self._set_last_neo4j_enhancement(tenant_id)
+
+            results["status"] = "completed"
+            results["completed_at"] = datetime.now().isoformat()
+
+            # Update status in cache
+            await self._cache.set(
+                f"ingestion_status:{tenant_id}",
+                "completed",
+                ttl=3600,
+            )
+
+            logger.info(f"Full ingestion complete for {tenant_id}: {results}")
+
+        except Exception as e:
+            logger.error(f"Full ingestion failed for {tenant_id}: {e}")
+            results["status"] = "failed"
+            results["error"] = str(e)
+
+            await self._cache.set(
+                f"ingestion_status:{tenant_id}",
+                f"failed: {str(e)}",
+                ttl=3600,
+            )
+
+        return results
+
+    async def get_ingestion_status(self, tenant_id: str) -> dict:
+        """Get ingestion status for a tenant.
+
+        Args:
+            tenant_id: Tenant identifier
+
+        Returns:
+            Ingestion status including last sync times
+        """
+        await self._cache.connect()
+
+        # Get last MSSQL sync time
+        last_mssql_sync = await self._cache.get(f"last_sync:{tenant_id}")
+
+        # Get last Neo4j enhancement time
+        last_neo4j_enhancement = await self._cache.get(f"last_neo4j_enhancement:{tenant_id}")
+
+        # Get current status
+        current_status = await self._cache.get(f"ingestion_status:{tenant_id}")
+
+        return {
+            "tenant_id": tenant_id,
+            "last_mssql_sync": last_mssql_sync,
+            "last_neo4j_enhancement": last_neo4j_enhancement,
+            "current_status": current_status or "idle",
+        }
+
+    async def _set_last_neo4j_enhancement(self, tenant_id: str) -> None:
+        """Set last Neo4j enhancement timestamp.
+
+        Args:
+            tenant_id: Tenant identifier
+        """
+        now = datetime.now()
+
+        await self._cache.set(
+            f"last_neo4j_enhancement:{tenant_id}",
+            now.isoformat(),
+            ttl=86400,  # 24 hours
+        )
+
 
 # Global scheduler instance
 _scheduler: IngestionScheduler = None
